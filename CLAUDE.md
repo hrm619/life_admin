@@ -29,7 +29,7 @@ uv run python main.py --config /path/to/config.json
 
 Two-phase system: **Briefing Workflow** (deterministic pipeline) then **Follow-up Agent** (interactive loop).
 
-**Flow:** `LoadLastRunNode` → `FetchIMessageNode` → `FetchCalendarNode` → `FetchGmailNode` → `FetchNotesNode` → `SummarizeBriefingNode` → `DisplayBriefingNode` → `FollowUpAgentNode` (loops on answer/draft_reply/draft_email/create_task, "refresh" loops back to LoadLastRunNode, exits on "done")
+**Flow:** `LoadLastRunNode` → `FetchIMessageNode` → `FetchCalendarNode` → `FetchGmailNode` → `FetchNotesNode` → `SummarizeBriefingNode` → `DisplayBriefingNode` → `IndexSourceDataNode` → `FollowUpAgentNode` (loops on answer/search_context/draft_reply/draft_email/create_task, "refresh" loops back to LoadLastRunNode, exits on "done")
 
 - `main.py` — entry point with argparse, loads `.env` and config, prints welcome banner, runs the flow
 - `nodes.py` — all PocketFlow node definitions plus `_extract_json()` helper for parsing LLM responses
@@ -42,9 +42,21 @@ Two-phase system: **Briefing Workflow** (deterministic pipeline) then **Follow-u
 - `utils/fetch_calendar.py` — Google Calendar API client; fetches events for a configurable lookahead window
 - `utils/fetch_gmail.py` — Gmail API client; fetches unread/starred emails since last run (configurable max)
 - `utils/read_notes.py` — Apple Notes SQLite reader; reads from `NoteStore.sqlite`, decompresses gzipped protobuf bodies, skips encrypted notes
+- `utils/embeddings.py` — OpenAI `text-embedding-3-small` wrapper for single and batch embeddings
+- `utils/vector_store.py` — ephemeral ChromaDB wrapper for indexing source data and semantic search
 - `utils/format_briefing.py` — ANSI-colored terminal output for the briefing
 
-Data flows through PocketFlow's **shared store** dict — nodes read/write keys like `raw_messages`, `raw_events`, `raw_emails`, `raw_notes`, `briefing`, `conversation_history`, `drafted_replies`, `created_tasks`.
+Data flows through PocketFlow's **shared store** dict — nodes read/write keys like `raw_messages`, `raw_events`, `raw_emails`, `raw_notes`, `briefing`, `vector_index`, `retrieved_context`, `conversation_history`, `drafted_replies`, `created_tasks`.
+
+## RAG Follow-Up Agent
+
+The follow-up agent uses RAG instead of stuffing all raw data into the prompt:
+
+1. **IndexSourceDataNode** chunks all source data (messages grouped by chat+time, emails split at 2k chars, events as-is, notes split at 1k chars) and embeds them into an in-memory ChromaDB collection
+2. The agent prompt receives only the **briefing summary** and any **retrieved context** — not raw source data
+3. When the agent needs specific details, it uses `search_context` to semantically search the index, then answers on the next turn
+4. **Fallback**: if `OPENAI_API_KEY` is missing or embedding fails, the agent falls back to truncated raw data in the prompt (pre-RAG behavior)
+5. Conversation history is windowed to the last 10 exchanges to keep the prompt manageable
 
 ## Configuration
 
@@ -72,7 +84,7 @@ Config file at `~/.life_admin/config.json` (auto-created with defaults on first 
 ## Key Technical Details
 
 - Requires **Full Disk Access** for Terminal/Python to read `~/Library/Messages/chat.db` and `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`
-- API key loaded from `.env` via `python-dotenv` (`ANTHROPIC_API_KEY`)
+- API keys loaded from `.env` via `python-dotenv` (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` for embeddings)
 - Google Calendar and Gmail share OAuth2 credentials: place `client_secret.json` (from Google Cloud Console) in `~/.life_admin/`; first run opens browser for consent (both calendar.readonly and gmail.readonly scopes), token saved to `~/.life_admin/google_token.json`
 - If Google API is not configured, `FetchCalendarNode` and `FetchGmailNode` gracefully skip with a warning
 - If Apple Notes DB is not accessible, `FetchNotesNode` gracefully skips; encrypted/password-protected notes are always skipped
@@ -80,7 +92,7 @@ Config file at `~/.life_admin/config.json` (auto-created with defaults on first 
 - LLM responses are parsed via `_extract_json()` in `nodes.py` which handles both raw JSON and markdown-fenced JSON blocks; raises `ValueError` on failure to trigger PocketFlow's retry mechanism
 - The FollowUpAgentNode loops via PocketFlow action strings (edge connections back to self), not a while loop
 - `write_last_run` is called in FollowUpAgentNode's "done" action (not DisplayBriefingNode) to avoid marking messages as seen if the session crashes
-- Raw messages are truncated at ~60-80k chars before being sent to the LLM to stay within context limits
+- With RAG enabled, raw data is not sent to the follow-up agent LLM — only briefing + retrieved chunks. Without RAG (fallback), raw data is truncated at ~60-80k chars
 - Read-only access to all data sources — never modify or send messages autonomously
 
 ## PocketFlow Patterns

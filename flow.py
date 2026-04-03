@@ -7,6 +7,7 @@ from nodes import (
     FetchIMessageNode,
     FetchNotesNode,
     FollowUpAgentNode,
+    IndexSourceDataNode,
     LoadLastRunNode,
     SummarizeBriefingNode,
 )
@@ -20,16 +21,18 @@ def create_flow() -> Flow:
     fetch_notes = FetchNotesNode(max_retries=2)
     summarize = SummarizeBriefingNode(max_retries=3)
     display = DisplayBriefingNode()
+    index = IndexSourceDataNode(max_retries=2)
     agent = FollowUpAgentNode(max_retries=2)
 
     # Briefing pipeline
-    load >> fetch_imsg >> fetch_cal >> fetch_gmail >> fetch_notes >> summarize >> display >> agent
+    load >> fetch_imsg >> fetch_cal >> fetch_gmail >> fetch_notes >> summarize >> display >> index >> agent
 
     # Agent loop — routes back to self on actions
     agent - "answer" >> agent
     agent - "draft_reply" >> agent
     agent - "draft_email" >> agent
     agent - "create_task" >> agent
+    agent - "search_context" >> agent
     agent - "refresh" >> load
     # "done" has no successor — flow ends
 

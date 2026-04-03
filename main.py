@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from flow import create_flow
 from utils.config import load_config
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -37,6 +37,8 @@ def main():
         "conversation_history": [],
         "drafted_replies": [],
         "created_tasks": [],
+        "vector_index": None,
+        "retrieved_context": [],
     }
 
     flow = create_flow()

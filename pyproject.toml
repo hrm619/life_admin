@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "anthropic>=0.88.0",
+    "chromadb>=1.0",
     "google-api-python-client>=2.0",
     "google-auth-httplib2>=0.2",
     "google-auth-oauthlib>=1.0",
+    "openai>=1.0",
     "pocketflow>=0.0.3",
     "python-dotenv>=1.2.2",
 ]

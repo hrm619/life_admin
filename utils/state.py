@@ -8,8 +8,14 @@ LAST_RUN_FILE = STATE_DIR / "last_run.json"
 def read_last_run() -> str | None:
     if not LAST_RUN_FILE.exists():
         return None
-    data = json.loads(LAST_RUN_FILE.read_text())
-    return data.get("last_run")
+    text = LAST_RUN_FILE.read_text().strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        return data.get("last_run")
+    except json.JSONDecodeError:
+        return None
 
 
 def write_last_run(timestamp: str) -> None:
