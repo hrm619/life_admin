@@ -39,6 +39,7 @@ def main():
         "created_tasks": [],
         "vector_index": None,
         "retrieved_context": [],
+        "source_inventory": "",
     }
 
     flow = create_flow()

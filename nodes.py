@@ -47,6 +47,9 @@ class LoadLastRunNode(Node):
     def post(self, shared, _, exec_res):
         shared["last_run_timestamp"] = exec_res
         shared["current_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Record fetch start time — this becomes the next run's "since" timestamp
+        # (not datetime.now() at "done" time, to avoid a gap where messages are lost)
+        shared["fetch_timestamp"] = datetime.now(timezone.utc).isoformat()
         return "default"
 
 
@@ -507,6 +510,30 @@ class IndexSourceDataNode(Node):
 
     def post(self, shared, prep_res, exec_res):
         shared["vector_index"] = exec_res
+
+        # Build a compact source inventory so the agent knows what's searchable
+        inventory = []
+        if shared.get("raw_messages"):
+            senders = {m.get("sender", "?") for m in shared["raw_messages"] if not m.get("is_from_me")}
+            if senders:
+                inventory.append(f"iMessage contacts: {', '.join(sorted(senders))}")
+        if shared.get("raw_emails"):
+            subjects = [e.get("subject", "") for e in shared["raw_emails"] if e.get("subject")]
+            froms = [e.get("from", "") for e in shared["raw_emails"] if e.get("from")]
+            if froms:
+                inventory.append(f"Email from: {', '.join(froms[:20])}")
+            if subjects:
+                inventory.append(f"Email subjects: {', '.join(subjects[:20])}")
+        if shared.get("raw_events"):
+            titles = [e.get("title", "") for e in shared["raw_events"] if e.get("title")]
+            if titles:
+                inventory.append(f"Calendar events: {', '.join(titles[:20])}")
+        if shared.get("raw_notes"):
+            note_titles = [n.get("title", "") for n in shared["raw_notes"] if n.get("title")]
+            if note_titles:
+                inventory.append(f"Notes: {', '.join(note_titles[:20])}")
+        shared["source_inventory"] = "\n".join(inventory) if inventory else "(No source data available)"
+
         if exec_res is not None and prep_res is not None:
             sources = {c["metadata"]["source"] for c in prep_res}
             print(f"[Index] Indexed {len(prep_res)} chunks across {len(sources)} sources")
@@ -520,6 +547,9 @@ AGENT_PROMPT = """Today's date: {current_date}
 
 ### Morning Briefing
 {briefing_json}
+
+### Available Source Data (searchable)
+{source_inventory}
 
 ### Retrieved Context
 {retrieved_context}
@@ -538,10 +568,17 @@ AGENT_PROMPT = """Today's date: {current_date}
 
 ## ACTION SPACE
 
-Decide the single best action. If Hank asks for specific details that aren't
-in the briefing summary (exact wording of a message, full email body, specific
-note contents), use search_context FIRST to retrieve the relevant data, then
-answer on the next turn.
+Decide the single best action.
+
+IMPORTANT: The briefing above is a SUMMARY — it does not contain full message
+text, email bodies, or note contents. If Hank asks about a specific person,
+message, email, event, or note — even if it was mentioned in the briefing —
+you MUST use search_context to retrieve the actual content before answering.
+Only use "answer" directly if the briefing summary alone fully answers the
+question (e.g. "how many action items?" or "what's on my schedule today?").
+
+If retrieved context is already populated below from a previous search, you
+may answer using that context without searching again.
 
 [1] answer
   Description: Answer Hank's question using the briefing and/or retrieved context
@@ -595,6 +632,43 @@ answer on the next turn.
 
 Return ONLY valid JSON:
 {{"action": "answer|search_context|draft_reply|draft_email|create_task|refresh|done", ...parameters from above}}"""
+
+# Post-search prompt — agent already searched, now must answer with retrieved context
+POST_SEARCH_PROMPT = """Today's date: {current_date}
+
+### Morning Briefing
+{briefing_json}
+
+### Retrieved Context (from search)
+{retrieved_context}
+
+### Conversation So Far
+{conversation_history}
+
+### Drafts Created This Session
+{drafted_replies}
+
+### Tasks Created This Session
+{created_tasks}
+
+## HANK'S INPUT
+{user_input}
+
+## INSTRUCTIONS
+
+You just searched the source data and the results are in "Retrieved Context" above.
+Answer Hank's question using that context. If the context doesn't contain what he
+asked about, say so clearly — do NOT search again.
+
+Choose one action:
+
+[1] answer — Answer using the retrieved context
+[2] draft_reply — Draft an iMessage reply
+[3] draft_email — Draft an email reply
+[4] create_task — Create a task
+
+Return ONLY valid JSON:
+{{"action": "answer|draft_reply|draft_email|create_task", "response": "...", ...}}"""
 
 # Fallback prompt when vector index is not available — includes truncated raw data
 AGENT_PROMPT_FALLBACK = """Today's date: {current_date}
@@ -701,9 +775,10 @@ class FollowUpAgentNode(Node):
         }
 
         if has_index:
-            # RAG mode — include retrieved context only
+            # RAG mode — include retrieved context and source inventory
             retrieved = shared.get("retrieved_context", [])
             context["retrieved_context"] = "\n\n".join(retrieved) if retrieved else "(No context retrieved yet — use search_context to look up details)"
+            context["source_inventory"] = shared.get("source_inventory", "(No inventory available)")
         else:
             # Fallback mode — include truncated raw data
             max_chars = 60_000
@@ -728,6 +803,7 @@ class FollowUpAgentNode(Node):
         pending_query = shared.pop("_pending_search_query", None)
         if pending_query:
             context["_shortcut"] = None
+            context["_post_search"] = True
             context["user_input"] = pending_query
             return context
 
@@ -762,10 +838,22 @@ class FollowUpAgentNode(Node):
 
         print("[FollowUp] Thinking...")
 
-        if prep_res["_has_index"]:
+        if prep_res.get("_post_search"):
+            # Post-search: answer using retrieved context, no search_context option
+            prompt = POST_SEARCH_PROMPT.format(
+                current_date=prep_res["current_date"],
+                briefing_json=prep_res["briefing_json"],
+                retrieved_context=prep_res["retrieved_context"],
+                conversation_history=prep_res["conversation_history"],
+                drafted_replies=prep_res["drafted_replies"],
+                created_tasks=prep_res["created_tasks"],
+                user_input=prep_res["user_input"],
+            )
+        elif prep_res["_has_index"]:
             prompt = AGENT_PROMPT.format(
                 current_date=prep_res["current_date"],
                 briefing_json=prep_res["briefing_json"],
+                source_inventory=prep_res["source_inventory"],
                 retrieved_context=prep_res["retrieved_context"],
                 conversation_history=prep_res["conversation_history"],
                 drafted_replies=prep_res["drafted_replies"],
@@ -898,8 +986,9 @@ class FollowUpAgentNode(Node):
             return "refresh"
 
         else:  # done
-            # Write last run timestamp on clean exit
-            write_last_run(datetime.now(timezone.utc).isoformat())
+            # Write the fetch timestamp (when data was pulled), not now
+            # This avoids a gap where messages arriving during the session are lost
+            write_last_run(shared.get("fetch_timestamp", datetime.now(timezone.utc).isoformat()))
             drafts = len(shared["drafted_replies"])
             tasks = len(shared["created_tasks"])
             print(f"\n{exec_res.get('response', 'Goodbye!')}")
